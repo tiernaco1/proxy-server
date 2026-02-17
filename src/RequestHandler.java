@@ -2,6 +2,7 @@ import java.io.*;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 
 // Each instance of this handles one browser connection
 // reads the request, sends it to the real server, and pipes the response back
@@ -9,9 +10,14 @@ import java.util.ArrayList;
 public class RequestHandler implements Runnable {
 
     private Socket browserSocket;
+    private ConcurrentHashMap<String, byte[]> cache;
+    private ConcurrentHashMap<String, Boolean> blockedHosts;
 
-    public RequestHandler(Socket browserSocket) {
+    public RequestHandler(Socket browserSocket, ConcurrentHashMap<String, byte[]> cache,
+            ConcurrentHashMap<String, Boolean> blockedHosts) {
         this.browserSocket = browserSocket;
+        this.cache = cache;
+        this.blockedHosts = blockedHosts;
     }
 
     @Override
@@ -24,9 +30,11 @@ public class RequestHandler implements Runnable {
             InputStream fromBrowser = browserSocket.getInputStream();
             OutputStream toBrowser = browserSocket.getOutputStream();
 
-            // first line from the browser is something like "GET http://example.com/ HTTP/1.1"
+            // first line from the browser is something like "GET http://example.com/
+            // HTTP/1.1"
             String firstLine = readLine(fromBrowser);
-            if (firstLine == null || firstLine.isEmpty()) return;
+            if (firstLine == null || firstLine.isEmpty())
+                return;
 
             System.out.println(">> " + firstLine);
 
@@ -69,7 +77,8 @@ public class RequestHandler implements Runnable {
             // make sure theres a Host header (required by HTTP/1.1)
             if (!foundHost) {
                 String hostVal = req.host;
-                if (req.port != 80) hostVal += ":" + req.port;
+                if (req.port != 80)
+                    hostVal += ":" + req.port;
                 headerLines.add("Host: " + hostVal);
             }
 
@@ -87,7 +96,8 @@ public class RequestHandler implements Runnable {
             InputStream fromServer = webServerSocket.getInputStream();
 
             // send the rewritten request to the web server
-            // key thing: change "GET http://example.com/page HTTP/1.1" to "GET /page HTTP/1.1"
+            // key thing: change "GET http://example.com/page HTTP/1.1" to "GET /page
+            // HTTP/1.1"
             writeLine(toServer, req.buildRelativeRequestLine());
             for (String header : headerLines) {
                 writeLine(toServer, header);
@@ -119,13 +129,15 @@ public class RequestHandler implements Runnable {
             String respHeader;
             while ((respHeader = readLine(fromServer)) != null) {
                 writeLine(toBrowser, respHeader);
-                if (respHeader.isEmpty()) break; // blank line = headers done
+                if (respHeader.isEmpty())
+                    break; // blank line = headers done
 
                 String lc = respHeader.toLowerCase();
                 if (lc.startsWith("content-length:")) {
                     try {
                         respBodyLen = Integer.parseInt(respHeader.substring(15).trim());
-                    } catch (NumberFormatException ex) { /* ignore bad value */ }
+                    } catch (NumberFormatException ex) {
+                        /* ignore bad value */ }
                 }
                 if (lc.startsWith("transfer-encoding:") && lc.contains("chunked")) {
                     isChunked = true;
@@ -146,8 +158,10 @@ public class RequestHandler implements Runnable {
 
         } catch (SocketTimeoutException e) {
             System.err.println("Connection timed out: " + e.getMessage());
-            try { respondWithError(browserSocket.getOutputStream(), 504, "Gateway Timeout"); }
-            catch (IOException ex) { /* nothing we can do */ }
+            try {
+                respondWithError(browserSocket.getOutputStream(), 504, "Gateway Timeout");
+            } catch (IOException ex) {
+                /* nothing we can do */ }
         } catch (IOException e) {
             System.err.println("IO error handling request: " + e.getMessage());
         } finally {
@@ -190,7 +204,8 @@ public class RequestHandler implements Runnable {
         int left = numBytes;
         while (left > 0) {
             int got = src.read(buf, 0, Math.min(buf.length, left));
-            if (got == -1) break;
+            if (got == -1)
+                break;
             dest.write(buf, 0, got);
             left -= got;
         }
@@ -211,7 +226,8 @@ public class RequestHandler implements Runnable {
     private void relayChunkedBody(InputStream in, OutputStream out) throws IOException {
         while (true) {
             String sizeLine = readLine(in);
-            if (sizeLine == null) break;
+            if (sizeLine == null)
+                break;
             writeLine(out, sizeLine);
 
             // the size is in hex, might have ";extension" after it
@@ -226,7 +242,8 @@ public class RequestHandler implements Runnable {
             if (chunkSize == 0) {
                 // last chunk, read the final \r\n
                 String end = readLine(in);
-                if (end != null) writeLine(out, end);
+                if (end != null)
+                    writeLine(out, end);
                 break;
             }
 
@@ -235,7 +252,8 @@ public class RequestHandler implements Runnable {
 
             // each chunk ends with \r\n
             String afterChunk = readLine(in);
-            if (afterChunk != null) writeLine(out, afterChunk);
+            if (afterChunk != null)
+                writeLine(out, afterChunk);
         }
         out.flush();
     }
@@ -269,7 +287,10 @@ public class RequestHandler implements Runnable {
 
     private void safeClose(Socket s) {
         if (s != null) {
-            try { s.close(); } catch (IOException e) { }
+            try {
+                s.close();
+            } catch (IOException e) {
+            }
         }
     }
 }

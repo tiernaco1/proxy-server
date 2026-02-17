@@ -1,6 +1,9 @@
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 // main class - starts the proxy and listens for browser connections
 
@@ -26,14 +29,22 @@ public class ProxyServer {
             listener.bind(new java.net.InetSocketAddress(port));
             System.out.println("Proxy running on port " + port);
 
+            // create one pool of 50 reusable threads - shared across all connections
+            ExecutorService threadPool = Executors.newFixedThreadPool(50);
+
+            ConcurrentHashMap<String, byte[]> cache = new ConcurrentHashMap<>();
+            ConcurrentHashMap<String, Boolean> blockedHosts = new ConcurrentHashMap<>();
+
+            // clean up threads when Ctrl+C is pressed
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                threadPool.shutdown();
+            }));
+
             // sit here forever accepting new connections
             while (true) {
                 Socket client = listener.accept();
                 System.out.println("New connection from " + client.getInetAddress());
-
-                // handle each connection in its own thread so we can serve multiple at once
-                Thread t = new Thread(new RequestHandler(client));
-                t.start();
+                threadPool.execute(new RequestHandler(client, cache, blockedHosts));
             }
         } catch (IOException e) {
             System.err.println("Failed to start proxy: " + e.getMessage());
