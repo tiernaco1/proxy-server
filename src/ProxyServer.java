@@ -33,13 +33,13 @@ public class ProxyServer {
             // create one pool of 50 reusable threads - shared across all connections
             ExecutorService threadPool = Executors.newFixedThreadPool(50);
 
-            ConcurrentHashMap<String, byte[]> cache = new ConcurrentHashMap<>();
+            ConcurrentHashMap<String, CachedResponse> cache = new ConcurrentHashMap<>();
             ConcurrentHashMap<String, Boolean> blockedHosts = new ConcurrentHashMap<>();
 
             // counters for tracking request stats - shared with RequestHandler and console
             AtomicInteger totalRequests = new AtomicInteger(0);
-            AtomicInteger cacheHits     = new AtomicInteger(0);
-            AtomicInteger cacheMisses   = new AtomicInteger(0);
+            AtomicInteger cacheHits = new AtomicInteger(0);
+            AtomicInteger cacheMisses = new AtomicInteger(0);
 
             // start the management console on its own thread so it can read stdin
             // while the main thread stays in the accept loop

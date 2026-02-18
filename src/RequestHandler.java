@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class RequestHandler implements Runnable {
 
     private Socket browserSocket;
-    private ConcurrentHashMap<String, byte[]> cache;
+    private ConcurrentHashMap<String, CachedResponse> cache;
     private ConcurrentHashMap<String, Boolean> blockedHosts;
     private AtomicInteger totalRequests;
     private AtomicInteger cacheHits;
@@ -22,15 +22,18 @@ public class RequestHandler implements Runnable {
     // shared across all handler instances - DateTimeFormatter is thread-safe
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    public RequestHandler(Socket browserSocket, ConcurrentHashMap<String, byte[]> cache,
+    // how long a cached response stays valid before it has to be re-fetched
+    private static final long CACHE_TTL_MS = 60_000L; // 60 seconds
+
+    public RequestHandler(Socket browserSocket, ConcurrentHashMap<String, CachedResponse> cache,
             ConcurrentHashMap<String, Boolean> blockedHosts,
             AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses) {
-        this.browserSocket  = browserSocket;
-        this.cache          = cache;
-        this.blockedHosts   = blockedHosts;
-        this.totalRequests  = totalRequests;
-        this.cacheHits      = cacheHits;
-        this.cacheMisses    = cacheMisses;
+        this.browserSocket = browserSocket;
+        this.cache         = cache;
+        this.blockedHosts  = blockedHosts;
+        this.totalRequests = totalRequests;
+        this.cacheHits     = cacheHits;
+        this.cacheMisses   = cacheMisses;
     }
 
     @Override
@@ -41,7 +44,7 @@ public class RequestHandler implements Runnable {
             browserSocket.setSoTimeout(10000);
 
             InputStream fromBrowser = browserSocket.getInputStream();
-            OutputStream toBrowser = browserSocket.getOutputStream();
+            OutputStream toBrowser  = browserSocket.getOutputStream();
 
             // first line from the browser is something like "GET http://example.com/ HTTP/1.1"
             String firstLine = readLine(fromBrowser);
@@ -96,12 +99,53 @@ public class RequestHandler implements Runnable {
             if (blockedHosts.containsKey(req.host)) {
                 totalRequests.incrementAndGet();
                 cacheMisses.incrementAndGet();
-                logRequest(req, "403");
+                logRequest(req, "403", 0L, false);
                 respondWithError(toBrowser, 403, "Blocked");
                 return;
             }
 
-            // now connect to the actual web server
+            // build the cache key from the full URL - used for both lookup and storage
+            String cacheKey = "http://" + req.host
+                    + (req.port == 80 ? "" : ":" + req.port)
+                    + req.path;
+
+            // only GET requests can be served from cache
+            // POST/PUT etc have side effects so they always go to the origin
+            if (req.method.equals("GET")) {
+                CachedResponse cached = cache.get(cacheKey);
+                if (cached != null && System.currentTimeMillis() > cached.expiry) {
+                    // entry is stale - remove it and fall through to origin fetch
+                    cache.remove(cacheKey);
+                    cached = null;
+                }
+                // check if entry exists and hasn't expired yet
+                if (cached != null) {
+                    // CACHE HIT - send the stored response directly, no network needed
+                    long startNano = System.nanoTime();
+                    writeLine(toBrowser, cached.statusLine);
+                    for (String hdr : cached.headers) {
+                        writeLine(toBrowser, hdr);
+                    }
+                    writeLine(toBrowser, ""); // blank line = end of headers
+                    toBrowser.write(cached.body);
+                    toBrowser.flush();
+
+                    long elapsedMs = (System.nanoTime() - startNano) / 1_000_000L;
+                    totalRequests.incrementAndGet();
+                    cacheHits.incrementAndGet();
+
+                    // pull status code out of the stored status line for the log
+                    String[] sp = cached.statusLine.split(" ", 3);
+                    String hitCode = (sp.length >= 2) ? sp[1] : "200";
+                    logRequest(req, hitCode, elapsedMs, true);
+                    return;
+                }
+            }
+
+            // CACHE MISS - connect to the actual web server
+            // start timing here so we measure the full origin fetch time
+            long startNano = System.nanoTime();
+
             try {
                 webServerSocket = new Socket(req.host, req.port);
                 webServerSocket.setSoTimeout(10000);
@@ -129,8 +173,6 @@ public class RequestHandler implements Runnable {
             }
             toServer.flush();
 
-            // now read the response from the web server and send it back to the browser
-
             // grab the status line first (like "HTTP/1.1 200 OK")
             String statusLine = readLine(fromServer);
             if (statusLine == null) {
@@ -143,14 +185,11 @@ public class RequestHandler implements Runnable {
             String[] sp = statusLine.split(" ", 3);
             String statusCode = (sp.length >= 2) ? sp[1] : "???";
 
-            // update counters and print the log line
-            totalRequests.incrementAndGet();
-            cacheMisses.incrementAndGet(); // stub until caching is implemented in step 7
-            logRequest(req, statusCode);
-
-            // read response headers, figure out how long the body is
+            // read response headers - also collect them and check for cache directives
             int respBodyLen = -1;
             boolean isChunked = false;
+            boolean noCacheDirective = false;
+            ArrayList<String> respHeaders = new ArrayList<>();
 
             String respHeader;
             while ((respHeader = readLine(fromServer)) != null) {
@@ -159,35 +198,90 @@ public class RequestHandler implements Runnable {
                     break; // blank line = headers done
 
                 String lc = respHeader.toLowerCase();
+
                 if (lc.startsWith("content-length:")) {
                     try {
                         respBodyLen = Integer.parseInt(respHeader.substring(15).trim());
-                    } catch (NumberFormatException ex) {
-                        /* ignore bad value */ }
+                    } catch (NumberFormatException ex) { /* ignore bad value */ }
                 }
                 if (lc.startsWith("transfer-encoding:") && lc.contains("chunked")) {
                     isChunked = true;
                 }
+                // if the server says not to cache, respect it
+                if (lc.startsWith("cache-control:")) {
+                    String ccVal = lc.substring("cache-control:".length()).trim();
+                    if (ccVal.contains("no-store") || ccVal.contains("no-cache")) {
+                        noCacheDirective = true;
+                    }
+                }
+                // collect headers so we can store them if we decide to cache this response
+                respHeaders.add(respHeader);
             }
             toBrowser.flush();
 
             // relay the response body back to the browser
+            // only capture body bytes in the Content-Length case - thats the only one we cache
+            // chunked and EOF responses are relayed but not stored
+            byte[] capturedBody = null;
+
             if (isChunked) {
-                relayChunkedBody(fromServer, toBrowser);
+                capturedBody = captureAndRelayChunkedBody(fromServer, toBrowser);
             } else if (respBodyLen >= 0) {
-                pipeBytes(fromServer, toBrowser, respBodyLen);
+                // read the whole body into memory so we can forward it AND potentially cache it
+                capturedBody = new byte[respBodyLen];
+                int totalRead = 0;
+                while (totalRead < respBodyLen) {
+                    int got = fromServer.read(capturedBody, totalRead, respBodyLen - totalRead);
+                    if (got == -1) break;
+                    totalRead += got;
+                }
+                toBrowser.write(capturedBody, 0, totalRead);
+                // if the server closed early and sent fewer bytes than promised, dont cache it
+                if (totalRead < respBodyLen) capturedBody = null;
             } else {
-                // no content-length and not chunked - just read until connection closes
+                // no content-length and not chunked - read until connection closes
                 pipeUntilDone(fromServer, toBrowser);
             }
             toBrowser.flush();
+
+            // stop the timer and log now that the full response has been sent
+            long elapsedMs = (System.nanoTime() - startNano) / 1_000_000L;
+            totalRequests.incrementAndGet();
+            cacheMisses.incrementAndGet();
+            logRequest(req, statusCode, elapsedMs, false);
+
+            // store in cache if: GET request, 200 OK, body was captured, no no-cache directive
+            if (req.method.equals("GET") && statusCode.equals("200")
+                    && capturedBody != null && !noCacheDirective) {
+                // chunked responses need header fixup before caching:
+                // remove Transfer-Encoding: chunked and replace with Content-Length
+                // so the browser gets a valid response when we serve from cache later
+                ArrayList<String> cacheHeaders = respHeaders;
+                if (isChunked) {
+                    cacheHeaders = new ArrayList<>();
+                    for (String ch : respHeaders) {
+                        if (!ch.toLowerCase().startsWith("transfer-encoding:")) {
+                            cacheHeaders.add(ch);
+                        }
+                    }
+                    cacheHeaders.add("Content-Length: " + capturedBody.length);
+                }
+
+                // evict one entry when the cache is full (simple approach - remove first key)
+                if (cache.size() >= 100) {
+                    String evictKey = cache.keys().nextElement();
+                    cache.remove(evictKey);
+                }
+                long now = System.currentTimeMillis();
+                cache.put(cacheKey, new CachedResponse(
+                        statusLine, cacheHeaders, capturedBody, now, now + CACHE_TTL_MS));
+            }
 
         } catch (SocketTimeoutException e) {
             System.err.println("Connection timed out: " + e.getMessage());
             try {
                 respondWithError(browserSocket.getOutputStream(), 504, "Gateway Timeout");
-            } catch (IOException ex) {
-                /* nothing we can do */ }
+            } catch (IOException ex) { /* nothing we can do */ }
         } catch (IOException e) {
             System.err.println("IO error handling request: " + e.getMessage());
         } finally {
@@ -196,13 +290,15 @@ public class RequestHandler implements Runnable {
         }
     }
 
-    // prints one structured log line per request:
-    // [14:32:07] 127.0.0.1   GET   http://example.com/   200
-    private void logRequest(HttpRequestParser req, String statusCode) {
+    // prints one structured log line per request including timing and cache hit/miss
+    private void logRequest(HttpRequestParser req, String statusCode,
+                            long elapsedMs, boolean fromCache) {
         String clientIP = browserSocket.getInetAddress().getHostAddress();
         String url = "http://" + req.host + (req.port == 80 ? "" : ":" + req.port) + req.path;
-        System.out.printf("[%s] %-20s %-8s %-50s %s%n",
-                LocalTime.now().format(TIME_FMT), clientIP, req.method, url, statusCode);
+        String tag = fromCache ? "HIT" : "MISS";
+        System.out.printf("[%s] %-20s %-8s %-50s %s  %4dms  %s%n",
+                LocalTime.now().format(TIME_FMT), clientIP, req.method, url,
+                statusCode, elapsedMs, tag);
     }
 
     // reads one line from an input stream, byte by byte, looking for \r\n
@@ -255,42 +351,52 @@ public class RequestHandler implements Runnable {
         }
     }
 
-    // handles chunked transfer encoding
-    // each chunk starts with a hex size, then the data, then \r\n
-    // a chunk of size 0 means we're done
-    private void relayChunkedBody(InputStream in, OutputStream out) throws IOException {
+    // relays a chunked response to the browser AND assembles the body into memory
+    // returns the complete decoded body so it can be cached, or null if something broke
+    // each chunk is: hex-size\r\n + data + \r\n, terminated by a 0-size chunk
+    private byte[] captureAndRelayChunkedBody(InputStream in, OutputStream out) throws IOException {
+        ByteArrayOutputStream assembled = new ByteArrayOutputStream();
         while (true) {
             String sizeLine = readLine(in);
             if (sizeLine == null)
-                break;
+                return null;
             writeLine(out, sizeLine);
 
-            // the size is in hex, might have ";extension" after it
+            // size is hex, strip any chunk extensions after ";"
             String hexPart = sizeLine.split(";")[0].trim();
             int chunkSize;
             try {
                 chunkSize = Integer.parseInt(hexPart, 16);
             } catch (NumberFormatException e) {
-                break;
+                return null;
             }
 
             if (chunkSize == 0) {
-                // last chunk, read the final \r\n
+                // terminating chunk - read trailing \r\n and we're done
                 String end = readLine(in);
                 if (end != null)
                     writeLine(out, end);
-                break;
+                out.flush();
+                return assembled.toByteArray();
             }
 
-            // read the actual chunk data
-            pipeBytes(in, out, chunkSize);
+            // read exact chunk bytes, relay to browser AND save to assembled buffer
+            byte[] chunk = new byte[chunkSize];
+            int totalRead = 0;
+            while (totalRead < chunkSize) {
+                int got = in.read(chunk, totalRead, chunkSize - totalRead);
+                if (got == -1)
+                    return null; // server dropped connection mid-chunk
+                totalRead += got;
+            }
+            out.write(chunk, 0, totalRead);
+            assembled.write(chunk, 0, totalRead);
 
-            // each chunk ends with \r\n
+            // each chunk data block ends with \r\n
             String afterChunk = readLine(in);
             if (afterChunk != null)
                 writeLine(out, afterChunk);
         }
-        out.flush();
     }
 
     // looks through headers for Content-Length and returns its value, or -1
@@ -324,8 +430,7 @@ public class RequestHandler implements Runnable {
         if (s != null) {
             try {
                 s.close();
-            } catch (IOException e) {
-            }
+            } catch (IOException e) { }
         }
     }
 }

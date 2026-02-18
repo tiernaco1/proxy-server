@@ -11,7 +11,7 @@ public class ManagementConsole implements Runnable {
     // ConcurrentHashMap means multiple threads can read/write safely at the same
     // time
     private final ConcurrentHashMap<String, Boolean> blockedHosts;
-    private final ConcurrentHashMap<String, byte[]> cache;
+    private final ConcurrentHashMap<String, CachedResponse> cache;
 
     // atomic integers are used here instead of regular ints because
     // RequestHandler threads increment these from different threads concurrently
@@ -22,7 +22,7 @@ public class ManagementConsole implements Runnable {
     private final Scanner scanner = new Scanner(System.in);
 
     public ManagementConsole(ConcurrentHashMap<String, Boolean> blockedHosts,
-            ConcurrentHashMap<String, byte[]> cache,
+            ConcurrentHashMap<String, CachedResponse> cache,
             AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses) {
         this.blockedHosts = blockedHosts;
         this.cache = cache;
@@ -120,8 +120,13 @@ public class ManagementConsole implements Runnable {
                     System.out.println("Cache is empty.");
                 } else {
                     System.out.println("Cached URLs:");
-                    // show the url and how many bytes are stored for it
-                    cache.forEach((url, data) -> System.out.println("  " + url + "  (" + data.length + " bytes)"));
+                    // show the url, size, and how many seconds until the entry expires
+                    long now = System.currentTimeMillis();
+                    cache.forEach((url, cr) -> {
+                        long secsLeft = (cr.expiry - now) / 1000;
+                        String expiryTag = secsLeft > 0 ? "expires in " + secsLeft + "s" : "EXPIRED";
+                        System.out.println("  " + url + "  (" + cr.body.length + " bytes, " + expiryTag + ")");
+                    });
                 }
                 break;
             default:
