@@ -4,6 +4,7 @@ import java.net.Socket;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 // main class - starts the proxy and listens for browser connections
 
@@ -35,6 +36,20 @@ public class ProxyServer {
             ConcurrentHashMap<String, byte[]> cache = new ConcurrentHashMap<>();
             ConcurrentHashMap<String, Boolean> blockedHosts = new ConcurrentHashMap<>();
 
+            // counters for tracking request stats - shared with RequestHandler and console
+            AtomicInteger totalRequests = new AtomicInteger(0);
+            AtomicInteger cacheHits     = new AtomicInteger(0);
+            AtomicInteger cacheMisses   = new AtomicInteger(0);
+
+            // start the management console on its own thread so it can read stdin
+            // while the main thread stays in the accept loop
+            // daemon thread so it doesn't block the JVM from exiting on Ctrl+C
+            ManagementConsole console = new ManagementConsole(
+                    blockedHosts, cache, totalRequests, cacheHits, cacheMisses);
+            Thread consoleThread = new Thread(console, "management-console");
+            consoleThread.setDaemon(true);
+            consoleThread.start();
+
             // clean up threads when Ctrl+C is pressed
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 threadPool.shutdown();
@@ -43,8 +58,8 @@ public class ProxyServer {
             // sit here forever accepting new connections
             while (true) {
                 Socket client = listener.accept();
-                System.out.println("New connection from " + client.getInetAddress());
-                threadPool.execute(new RequestHandler(client, cache, blockedHosts));
+                threadPool.execute(new RequestHandler(
+                        client, cache, blockedHosts, totalRequests, cacheHits, cacheMisses));
             }
         } catch (IOException e) {
             System.err.println("Failed to start proxy: " + e.getMessage());

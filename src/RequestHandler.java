@@ -1,8 +1,11 @@
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 // Each instance of this handles one browser connection
 // reads the request, sends it to the real server, and pipes the response back
@@ -12,12 +15,22 @@ public class RequestHandler implements Runnable {
     private Socket browserSocket;
     private ConcurrentHashMap<String, byte[]> cache;
     private ConcurrentHashMap<String, Boolean> blockedHosts;
+    private AtomicInteger totalRequests;
+    private AtomicInteger cacheHits;
+    private AtomicInteger cacheMisses;
+
+    // shared across all handler instances - DateTimeFormatter is thread-safe
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     public RequestHandler(Socket browserSocket, ConcurrentHashMap<String, byte[]> cache,
-            ConcurrentHashMap<String, Boolean> blockedHosts) {
-        this.browserSocket = browserSocket;
-        this.cache = cache;
-        this.blockedHosts = blockedHosts;
+            ConcurrentHashMap<String, Boolean> blockedHosts,
+            AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses) {
+        this.browserSocket  = browserSocket;
+        this.cache          = cache;
+        this.blockedHosts   = blockedHosts;
+        this.totalRequests  = totalRequests;
+        this.cacheHits      = cacheHits;
+        this.cacheMisses    = cacheMisses;
     }
 
     @Override
@@ -30,13 +43,10 @@ public class RequestHandler implements Runnable {
             InputStream fromBrowser = browserSocket.getInputStream();
             OutputStream toBrowser = browserSocket.getOutputStream();
 
-            // first line from the browser is something like "GET http://example.com/
-            // HTTP/1.1"
+            // first line from the browser is something like "GET http://example.com/ HTTP/1.1"
             String firstLine = readLine(fromBrowser);
             if (firstLine == null || firstLine.isEmpty())
                 return;
-
-            System.out.println(">> " + firstLine);
 
             // try to parse it
             HttpRequestParser req;
@@ -82,6 +92,15 @@ public class RequestHandler implements Runnable {
                 headerLines.add("Host: " + hostVal);
             }
 
+            // check blocklist before connecting - return 403 if blocked
+            if (blockedHosts.containsKey(req.host)) {
+                totalRequests.incrementAndGet();
+                cacheMisses.incrementAndGet();
+                logRequest(req, "403");
+                respondWithError(toBrowser, 403, "Blocked");
+                return;
+            }
+
             // now connect to the actual web server
             try {
                 webServerSocket = new Socket(req.host, req.port);
@@ -96,8 +115,7 @@ public class RequestHandler implements Runnable {
             InputStream fromServer = webServerSocket.getInputStream();
 
             // send the rewritten request to the web server
-            // key thing: change "GET http://example.com/page HTTP/1.1" to "GET /page
-            // HTTP/1.1"
+            // key thing: change "GET http://example.com/page HTTP/1.1" to "GET /page HTTP/1.1"
             writeLine(toServer, req.buildRelativeRequestLine());
             for (String header : headerLines) {
                 writeLine(toServer, header);
@@ -120,7 +138,15 @@ public class RequestHandler implements Runnable {
                 return;
             }
             writeLine(toBrowser, statusLine);
-            System.out.println("<< " + statusLine);
+
+            // pull the status code out of "HTTP/1.1 200 OK" -> "200"
+            String[] sp = statusLine.split(" ", 3);
+            String statusCode = (sp.length >= 2) ? sp[1] : "???";
+
+            // update counters and print the log line
+            totalRequests.incrementAndGet();
+            cacheMisses.incrementAndGet(); // stub until caching is implemented in step 7
+            logRequest(req, statusCode);
 
             // read response headers, figure out how long the body is
             int respBodyLen = -1;
@@ -168,6 +194,15 @@ public class RequestHandler implements Runnable {
             safeClose(webServerSocket);
             safeClose(browserSocket);
         }
+    }
+
+    // prints one structured log line per request:
+    // [14:32:07] 127.0.0.1   GET   http://example.com/   200
+    private void logRequest(HttpRequestParser req, String statusCode) {
+        String clientIP = browserSocket.getInetAddress().getHostAddress();
+        String url = "http://" + req.host + (req.port == 80 ? "" : ":" + req.port) + req.path;
+        System.out.printf("[%s] %-20s %-8s %-50s %s%n",
+                LocalTime.now().format(TIME_FMT), clientIP, req.method, url, statusCode);
     }
 
     // reads one line from an input stream, byte by byte, looking for \r\n
