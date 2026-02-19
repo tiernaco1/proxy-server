@@ -1,10 +1,14 @@
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 // main class - starts the proxy and listens for browser connections
 
@@ -37,29 +41,49 @@ public class ProxyServer {
             ConcurrentHashMap<String, Boolean> blockedHosts = new ConcurrentHashMap<>();
 
             // counters for tracking request stats - shared with RequestHandler and console
-            AtomicInteger totalRequests = new AtomicInteger(0);
-            AtomicInteger cacheHits = new AtomicInteger(0);
-            AtomicInteger cacheMisses = new AtomicInteger(0);
+            AtomicInteger totalRequests  = new AtomicInteger(0);
+            AtomicInteger cacheHits      = new AtomicInteger(0);
+            AtomicInteger cacheMisses    = new AtomicInteger(0);
+
+            // accumulators for average response time per category
+            AtomicLong totalHitTimeMs  = new AtomicLong(0);
+            AtomicLong totalMissTimeMs = new AtomicLong(0);
+
+            // open CSV file for timing data - append mode so data survives restarts
+            // write the header row only if the file is brand new / empty
+            File csvFile = new File("proxy_timing.csv");
+            PrintWriter csvWriter = new PrintWriter(new FileWriter(csvFile, true));
+            if (csvFile.length() == 0) {
+                csvWriter.println("timestamp,url,cached,response_time_ms");
+                csvWriter.flush();
+            }
 
             // start the management console on its own thread so it can read stdin
             // while the main thread stays in the accept loop
             // daemon thread so it doesn't block the JVM from exiting on Ctrl+C
             ManagementConsole console = new ManagementConsole(
-                    blockedHosts, cache, totalRequests, cacheHits, cacheMisses);
+                    blockedHosts, cache, totalRequests, cacheHits, cacheMisses,
+                    totalHitTimeMs, totalMissTimeMs);
             Thread consoleThread = new Thread(console, "management-console");
             consoleThread.setDaemon(true);
             consoleThread.start();
 
-            // clean up threads when Ctrl+C is pressed
+            // clean up on Ctrl+C - flush the CSV so nothing gets lost
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 threadPool.shutdown();
+                synchronized (csvWriter) {
+                    csvWriter.flush();
+                    csvWriter.close();
+                }
             }));
 
             // sit here forever accepting new connections
             while (true) {
                 Socket client = listener.accept();
                 threadPool.execute(new RequestHandler(
-                        client, cache, blockedHosts, totalRequests, cacheHits, cacheMisses));
+                        client, cache, blockedHosts,
+                        totalRequests, cacheHits, cacheMisses,
+                        totalHitTimeMs, totalMissTimeMs, csvWriter));
             }
         } catch (IOException e) {
             System.err.println("Failed to start proxy: " + e.getMessage());

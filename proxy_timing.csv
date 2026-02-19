@@ -1,0 +1,11 @@
+timestamp,url,cached,response_time_ms
+2026-02-19 21:40:46,http://example.com/,no,108
+2026-02-19 21:40:46,http://example.com/,yes,0
+2026-02-19 21:41:28,http://detectportal.firefox.com/canonical.html,no,147
+2026-02-19 21:41:29,http://detectportal.firefox.com/success.txt?ipv4,no,71
+2026-02-19 21:41:29,http://detectportal.firefox.com/success.txt?ipv6,no,71
+2026-02-19 21:41:34,http://www.example.com/,no,53
+2026-02-19 21:42:12,http://detectportal.firefox.com/canonical.html,yes,0
+2026-02-19 21:42:14,http://www.example.com/,yes,1
+2026-02-19 21:42:15,http://detectportal.firefox.com/success.txt?ipv6,yes,0
+2026-02-19 21:42:15,http://detectportal.firefox.com/success.txt?ipv4,yes,1

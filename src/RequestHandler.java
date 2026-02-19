@@ -1,11 +1,13 @@
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 // Each instance of this handles one browser connection
 // reads the request, sends it to the real server, and pipes the response back
@@ -18,22 +20,30 @@ public class RequestHandler implements Runnable {
     private AtomicInteger totalRequests;
     private AtomicInteger cacheHits;
     private AtomicInteger cacheMisses;
+    private AtomicLong totalHitTimeMs;
+    private AtomicLong totalMissTimeMs;
+    private PrintWriter csvWriter;
 
     // shared across all handler instances - DateTimeFormatter is thread-safe
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final DateTimeFormatter CSV_TIME_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     // how long a cached response stays valid before it has to be re-fetched
     private static final long CACHE_TTL_MS = 60_000L; // 60 seconds
 
     public RequestHandler(Socket browserSocket, ConcurrentHashMap<String, CachedResponse> cache,
             ConcurrentHashMap<String, Boolean> blockedHosts,
-            AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses) {
+            AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses,
+            AtomicLong totalHitTimeMs, AtomicLong totalMissTimeMs, PrintWriter csvWriter) {
         this.browserSocket = browserSocket;
-        this.cache         = cache;
-        this.blockedHosts  = blockedHosts;
+        this.cache = cache;
+        this.blockedHosts = blockedHosts;
         this.totalRequests = totalRequests;
-        this.cacheHits     = cacheHits;
-        this.cacheMisses   = cacheMisses;
+        this.cacheHits = cacheHits;
+        this.cacheMisses = cacheMisses;
+        this.totalHitTimeMs = totalHitTimeMs;
+        this.totalMissTimeMs = totalMissTimeMs;
+        this.csvWriter = csvWriter;
     }
 
     @Override
@@ -44,9 +54,10 @@ public class RequestHandler implements Runnable {
             browserSocket.setSoTimeout(10000);
 
             InputStream fromBrowser = browserSocket.getInputStream();
-            OutputStream toBrowser  = browserSocket.getOutputStream();
+            OutputStream toBrowser = browserSocket.getOutputStream();
 
-            // first line from the browser is something like "GET http://example.com/ HTTP/1.1"
+            // first line from the browser is something like "GET http://example.com/
+            // HTTP/1.1"
             String firstLine = readLine(fromBrowser);
             if (firstLine == null || firstLine.isEmpty())
                 return;
@@ -159,7 +170,8 @@ public class RequestHandler implements Runnable {
             InputStream fromServer = webServerSocket.getInputStream();
 
             // send the rewritten request to the web server
-            // key thing: change "GET http://example.com/page HTTP/1.1" to "GET /page HTTP/1.1"
+            // key thing: change "GET http://example.com/page HTTP/1.1" to "GET /page
+            // HTTP/1.1"
             writeLine(toServer, req.buildRelativeRequestLine());
             for (String header : headerLines) {
                 writeLine(toServer, header);
@@ -202,7 +214,8 @@ public class RequestHandler implements Runnable {
                 if (lc.startsWith("content-length:")) {
                     try {
                         respBodyLen = Integer.parseInt(respHeader.substring(15).trim());
-                    } catch (NumberFormatException ex) { /* ignore bad value */ }
+                    } catch (NumberFormatException ex) {
+                        /* ignore bad value */ }
                 }
                 if (lc.startsWith("transfer-encoding:") && lc.contains("chunked")) {
                     isChunked = true;
@@ -220,7 +233,8 @@ public class RequestHandler implements Runnable {
             toBrowser.flush();
 
             // relay the response body back to the browser
-            // only capture body bytes in the Content-Length case - thats the only one we cache
+            // only capture body bytes in the Content-Length case - thats the only one we
+            // cache
             // chunked and EOF responses are relayed but not stored
             byte[] capturedBody = null;
 
@@ -232,12 +246,14 @@ public class RequestHandler implements Runnable {
                 int totalRead = 0;
                 while (totalRead < respBodyLen) {
                     int got = fromServer.read(capturedBody, totalRead, respBodyLen - totalRead);
-                    if (got == -1) break;
+                    if (got == -1)
+                        break;
                     totalRead += got;
                 }
                 toBrowser.write(capturedBody, 0, totalRead);
                 // if the server closed early and sent fewer bytes than promised, dont cache it
-                if (totalRead < respBodyLen) capturedBody = null;
+                if (totalRead < respBodyLen)
+                    capturedBody = null;
             } else {
                 // no content-length and not chunked - read until connection closes
                 pipeUntilDone(fromServer, toBrowser);
@@ -250,7 +266,8 @@ public class RequestHandler implements Runnable {
             cacheMisses.incrementAndGet();
             logRequest(req, statusCode, elapsedMs, false);
 
-            // store in cache if: GET request, 200 OK, body was captured, no no-cache directive
+            // store in cache if: GET request, 200 OK, body was captured, no no-cache
+            // directive
             if (req.method.equals("GET") && statusCode.equals("200")
                     && capturedBody != null && !noCacheDirective) {
                 // chunked responses need header fixup before caching:
@@ -281,7 +298,8 @@ public class RequestHandler implements Runnable {
             System.err.println("Connection timed out: " + e.getMessage());
             try {
                 respondWithError(browserSocket.getOutputStream(), 504, "Gateway Timeout");
-            } catch (IOException ex) { /* nothing we can do */ }
+            } catch (IOException ex) {
+                /* nothing we can do */ }
         } catch (IOException e) {
             System.err.println("IO error handling request: " + e.getMessage());
         } finally {
@@ -290,15 +308,34 @@ public class RequestHandler implements Runnable {
         }
     }
 
-    // prints one structured log line per request including timing and cache hit/miss
+    // prints one structured log line per request including timing and cache
+    // hit/miss
+    // also writes a row to the CSV file and updates the running time totals
     private void logRequest(HttpRequestParser req, String statusCode,
-                            long elapsedMs, boolean fromCache) {
+            long elapsedMs, boolean fromCache) {
         String clientIP = browserSocket.getInetAddress().getHostAddress();
         String url = "http://" + req.host + (req.port == 80 ? "" : ":" + req.port) + req.path;
         String tag = fromCache ? "HIT" : "MISS";
+
+        // console log
         System.out.printf("[%s] %-20s %-8s %-50s %s  %4dms  %s%n",
                 LocalTime.now().format(TIME_FMT), clientIP, req.method, url,
                 statusCode, elapsedMs, tag);
+
+        // write one row to the CSV - synchronized because multiple threads share the
+        // writer
+        String ts = LocalDateTime.now().format(CSV_TIME_FMT);
+        synchronized (csvWriter) {
+            csvWriter.printf("%s,%s,%s,%d%n", ts, url, fromCache ? "yes" : "no", elapsedMs);
+            csvWriter.flush();
+        }
+
+        // add to the right accumulator so we can calculate averages in stats
+        if (fromCache) {
+            totalHitTimeMs.addAndGet(elapsedMs);
+        } else {
+            totalMissTimeMs.addAndGet(elapsedMs);
+        }
     }
 
     // reads one line from an input stream, byte by byte, looking for \r\n
@@ -352,7 +389,8 @@ public class RequestHandler implements Runnable {
     }
 
     // relays a chunked response to the browser AND assembles the body into memory
-    // returns the complete decoded body so it can be cached, or null if something broke
+    // returns the complete decoded body so it can be cached, or null if something
+    // broke
     // each chunk is: hex-size\r\n + data + \r\n, terminated by a 0-size chunk
     private byte[] captureAndRelayChunkedBody(InputStream in, OutputStream out) throws IOException {
         ByteArrayOutputStream assembled = new ByteArrayOutputStream();
@@ -430,7 +468,8 @@ public class RequestHandler implements Runnable {
         if (s != null) {
             try {
                 s.close();
-            } catch (IOException e) { }
+            } catch (IOException e) {
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 import java.util.Scanner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 // runs on its own thread and lets you control the proxy while its running
 // reads commands from stdin so you can block/unblock hosts, check stats etc
@@ -19,16 +20,23 @@ public class ManagementConsole implements Runnable {
     private final AtomicInteger cacheHits;
     private final AtomicInteger cacheMisses;
 
+    // running totals for calculating average response times per category
+    private final AtomicLong totalHitTimeMs;
+    private final AtomicLong totalMissTimeMs;
+
     private final Scanner scanner = new Scanner(System.in);
 
     public ManagementConsole(ConcurrentHashMap<String, Boolean> blockedHosts,
             ConcurrentHashMap<String, CachedResponse> cache,
-            AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses) {
-        this.blockedHosts = blockedHosts;
-        this.cache = cache;
-        this.totalRequests = totalRequests;
-        this.cacheHits = cacheHits;
-        this.cacheMisses = cacheMisses;
+            AtomicInteger totalRequests, AtomicInteger cacheHits, AtomicInteger cacheMisses,
+            AtomicLong totalHitTimeMs, AtomicLong totalMissTimeMs) {
+        this.blockedHosts    = blockedHosts;
+        this.cache           = cache;
+        this.totalRequests   = totalRequests;
+        this.cacheHits       = cacheHits;
+        this.cacheMisses     = cacheMisses;
+        this.totalHitTimeMs  = totalHitTimeMs;
+        this.totalMissTimeMs = totalMissTimeMs;
     }
 
     @Override
@@ -136,17 +144,21 @@ public class ManagementConsole implements Runnable {
 
     // prints request stats - useful for showing the cache is actually saving time
     private void handleStats() {
-        int total = totalRequests.get();
-        int hits = cacheHits.get();
+        int total  = totalRequests.get();
+        int hits   = cacheHits.get();
         int misses = cacheMisses.get();
 
-        double hitRate = (total > 0) ? (100.0 * hits / total) : 0.0;
+        double hitRate   = (total  > 0) ? (100.0 * hits / total) : 0.0;
+        long avgHitMs    = (hits   > 0) ? totalHitTimeMs.get()  / hits   : 0;
+        long avgMissMs   = (misses > 0) ? totalMissTimeMs.get() / misses : 0;
 
         System.out.println("--- Proxy Stats ---");
-        System.out.printf("  Total requests : %d%n", total);
-        System.out.printf("  Cache hits     : %d%n", hits);
-        System.out.printf("  Cache misses   : %d%n", misses);
+        System.out.printf("  Total requests : %d%n",    total);
+        System.out.printf("  Cache hits     : %d%n",    hits);
+        System.out.printf("  Cache misses   : %d%n",    misses);
         System.out.printf("  Hit rate       : %.1f%%%n", hitRate);
+        System.out.printf("  Avg hit time   : %dms%n",  avgHitMs);
+        System.out.printf("  Avg miss time  : %dms%n",  avgMissMs);
     }
 
     private void printHelp() {
