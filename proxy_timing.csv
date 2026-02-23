@@ -9,3 +9,4 @@ timestamp,url,cached,response_time_ms
 2026-02-19 21:42:14,http://www.example.com/,yes,1
 2026-02-19 21:42:15,http://detectportal.firefox.com/success.txt?ipv6,yes,0
 2026-02-19 21:42:15,http://detectportal.firefox.com/success.txt?ipv4,yes,1
+2026-02-23 22:33:15,https://example.com:443,no,0

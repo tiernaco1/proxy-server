@@ -73,7 +73,11 @@ public class RequestHandler implements Runnable {
 
             // we dont handle CONNECT yet (thats for https)
             if (req.method.equals("CONNECT")) {
-                respondWithError(toBrowser, 501, "CONNECT Not Implemented");
+                // drain the CONNECT request headers before starting the tunnel
+                String drainLine;
+                while ((drainLine = readLine(fromBrowser)) != null && !drainLine.isEmpty()) {
+                }
+                handleConnect(fromBrowser, toBrowser, firstLine);
                 return;
             }
 
@@ -462,6 +466,76 @@ public class RequestHandler implements Runnable {
                 + page;
         out.write(resp.getBytes("ISO-8859-1"));
         out.flush();
+    }
+
+    // sets up a raw TCP tunnel for HTTPS CONNECT requests
+    // the proxy just relays bytes both ways - it never sees the encrypted content
+    private void handleConnect(InputStream fromBrowser, OutputStream toBrowser,
+            String firstLine) throws IOException {
+        // parse "CONNECT example.com:443 HTTP/1.1" -> host, port
+        String target = firstLine.split(" ")[1];
+        int colon = target.lastIndexOf(':');
+        String host = (colon >= 0) ? target.substring(0, colon) : target;
+        int port;
+        try {
+            port = (colon >= 0) ? Integer.parseInt(target.substring(colon + 1)) : 443;
+        } catch (NumberFormatException e) {
+            port = 443;
+        }
+
+        // same blocklist check as HTTP
+        if (blockedHosts.containsKey(host)) {
+            totalRequests.incrementAndGet();
+            respondWithError(toBrowser, 403, "Blocked");
+            return;
+        }
+
+        // open a plain TCP socket to the target - browser handles TLS itself
+        final Socket tunnelSocket;
+        try {
+            tunnelSocket = new Socket(host, port);
+        } catch (IOException e) {
+            respondWithError(toBrowser, 502, "Bad Gateway");
+            return;
+        }
+
+        try {
+            // tell the browser the tunnel is open - TLS handshake starts immediately after
+            toBrowser.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes("ISO-8859-1"));
+            toBrowser.flush();
+            totalRequests.incrementAndGet();
+
+            // log to console and CSV - no timing since tunnels stay open indefinitely
+            String clientIP = browserSocket.getInetAddress().getHostAddress();
+            System.out.printf("[%s] %-20s %-8s %-50s %s  tunnel%n",
+                    LocalTime.now().format(TIME_FMT), clientIP, "CONNECT",
+                    host + ":" + port, "200");
+            String ts = LocalDateTime.now().format(CSV_TIME_FMT);
+            synchronized (csvWriter) {
+                csvWriter.printf("%s,https://%s:%d,no,0%n", ts, host, port);
+                csvWriter.flush();
+            }
+
+            InputStream  fromServer = tunnelSocket.getInputStream();
+            OutputStream toServer   = tunnelSocket.getOutputStream();
+
+            // server→browser relay on a new thread - blocking I/O requires two threads
+            // for bidirectional piping
+            Thread s2b = new Thread(() -> {
+                try { pipeUntilDone(fromServer, toBrowser); } catch (IOException e) { }
+                safeClose(tunnelSocket);
+                safeClose(browserSocket);
+            });
+            s2b.setDaemon(true);
+            s2b.start();
+
+            // browser→server relay runs on the current thread
+            try { pipeUntilDone(fromBrowser, toServer); } catch (IOException e) { }
+
+        } finally {
+            // closing tunnelSocket causes the s2b thread's read to throw and exit
+            safeClose(tunnelSocket);
+        }
     }
 
     private void safeClose(Socket s) {
