@@ -10,3 +10,17 @@ timestamp,url,cached,response_time_ms
 2026-02-19 21:42:15,http://detectportal.firefox.com/success.txt?ipv6,yes,0
 2026-02-19 21:42:15,http://detectportal.firefox.com/success.txt?ipv4,yes,1
 2026-02-23 22:33:15,https://example.com:443,no,0
+2026-02-24 19:52:55,http://example.com/,no,101
+2026-02-24 19:53:00,http://example.com/,yes,1
+2026-02-24 19:54:14,http://example.com/,no,50
+2026-02-24 19:54:22,http://example.com/,yes,0
+2026-02-24 19:54:28,http://httpbin.org/response-headers?Cache-Control=no-cache,no,932
+2026-02-24 19:54:28,http://httpbin.org/response-headers?Cache-Control=no-cache,no,471
+2026-02-24 19:54:47,http://example.com/,no,0
+2026-02-24 19:55:01,http://example.com/,yes,0
+2026-02-24 19:55:08,https://example.com:443,no,0
+2026-02-24 19:56:24,http://httpbin.org/get,no,359
+2026-02-24 19:56:24,http://httpbin.org/get,no,361
+2026-02-24 19:56:24,http://httpbin.org/get,no,356
+2026-02-24 19:56:24,http://httpbin.org/get,no,602
+2026-02-24 19:56:25,http://httpbin.org/get,no,1249

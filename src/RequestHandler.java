@@ -71,7 +71,6 @@ public class RequestHandler implements Runnable {
                 return;
             }
 
-            // we dont handle CONNECT yet (thats for https)
             if (req.method.equals("CONNECT")) {
                 // drain the CONNECT request headers before starting the tunnel
                 String drainLine;
@@ -516,13 +515,16 @@ public class RequestHandler implements Runnable {
                 csvWriter.flush();
             }
 
-            InputStream  fromServer = tunnelSocket.getInputStream();
-            OutputStream toServer   = tunnelSocket.getOutputStream();
+            InputStream fromServer = tunnelSocket.getInputStream();
+            OutputStream toServer = tunnelSocket.getOutputStream();
 
             // server→browser relay on a new thread - blocking I/O requires two threads
             // for bidirectional piping
             Thread s2b = new Thread(() -> {
-                try { pipeUntilDone(fromServer, toBrowser); } catch (IOException e) { }
+                try {
+                    pipeUntilDone(fromServer, toBrowser);
+                } catch (IOException e) {
+                }
                 safeClose(tunnelSocket);
                 safeClose(browserSocket);
             });
@@ -530,7 +532,10 @@ public class RequestHandler implements Runnable {
             s2b.start();
 
             // browser→server relay runs on the current thread
-            try { pipeUntilDone(fromBrowser, toServer); } catch (IOException e) { }
+            try {
+                pipeUntilDone(fromBrowser, toServer);
+            } catch (IOException e) {
+            }
 
         } finally {
             // closing tunnelSocket causes the s2b thread's read to throw and exit
